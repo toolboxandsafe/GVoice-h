@@ -9,9 +9,14 @@ import { readdir, readFile } from "fs/promises";
 import { join } from "path";
 import { JSDOM } from "jsdom";
 
-const SUPABASE_URL = "https://tlbglqreblkvypoocscq.supabase.co";
-const SERVICE_KEY =
-  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRsYmdscXJlYmxrdnlwb29jc2NxIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NTY2NDkwOSwiZXhwIjoyMDkxMjQwOTA5fQ.oW7hvhz7zo0yEdLp1ybSHUuhCCxr-TmK8QgRBjdTJhI";
+const SUPABASE_URL = process.env.SUPABASE_URL || "https://tlbglqreblkvypoocscq.supabase.co";
+const SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
+
+if (!SERVICE_KEY) {
+  console.error("Error: SUPABASE_SERVICE_KEY environment variable is required.");
+  console.error("Usage: SUPABASE_SERVICE_KEY=your_key node upload.mjs <path>");
+  process.exit(1);
+}
 
 // --- Parser (same logic as the app) ---
 function parseGVoiceHTML(htmlString, fileName) {
