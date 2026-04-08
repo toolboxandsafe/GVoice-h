@@ -1,183 +1,35 @@
 import { useState, useCallback, useMemo, useRef, useEffect } from "react";
+import { createClient } from "@supabase/supabase-js";
 
-// --- IndexedDB persistence ---
-const DB_NAME = "gvoice-archive";
-const DB_VERSION = 1;
+const supabase = createClient(
+  "https://tlbglqreblkvypoocscq.supabase.co",
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRsYmdscXJlYmxrdnlwb29jc2NxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzU2NjQ5MDksImV4cCI6MjA5MTI0MDkwOX0.ILFqHOrbsGEHQ3auxiIJbAJLpxMqdBfJnrrc8ZrKrsM"
+);
 
-function openDB() {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, DB_VERSION);
-    req.onupgradeneeded = () => {
-      const db = req.result;
-      if (!db.objectStoreNames.contains("data")) {
-        db.createObjectStore("data");
-      }
-    };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-
-async function saveToDB(conversations, allMessages) {
-  const db = await openDB();
-  const tx = db.transaction("data", "readwrite");
-  const store = tx.objectStore("data");
-  // Serialize dates to timestamps for storage
-  const serializedMessages = allMessages.map((m) => ({
-    ...m,
-    date: m.date ? m.date.getTime() : null,
-  }));
-  const serializedConvos = conversations.map((c) => ({
-    ...c,
-    messages: c.messages.map((m) => ({
-      ...m,
-      date: m.date ? m.date.getTime() : null,
-    })),
-  }));
-  store.put(serializedMessages, "allMessages");
-  store.put(serializedConvos, "conversations");
-  store.put(Date.now(), "savedAt");
-  return new Promise((resolve, reject) => {
-    tx.oncomplete = resolve;
-    tx.onerror = () => reject(tx.error);
-  });
-}
-
-async function loadFromDB() {
-  const db = await openDB();
-  const tx = db.transaction("data", "readonly");
-  const store = tx.objectStore("data");
-  const [msgs, convos, savedAt] = await Promise.all([
-    new Promise((r) => { const req = store.get("allMessages"); req.onsuccess = () => r(req.result); req.onerror = () => r(null); }),
-    new Promise((r) => { const req = store.get("conversations"); req.onsuccess = () => r(req.result); req.onerror = () => r(null); }),
-    new Promise((r) => { const req = store.get("savedAt"); req.onsuccess = () => r(req.result); req.onerror = () => r(null); }),
-  ]);
-  if (!msgs || !convos) return null;
-  // Restore dates from timestamps
-  const allMessages = msgs.map((m) => ({
-    ...m,
-    date: m.date ? new Date(m.date) : null,
-  }));
-  const conversations = convos.map((c) => ({
-    ...c,
-    messages: c.messages.map((m) => ({
-      ...m,
-      date: m.date ? new Date(m.date) : null,
-    })),
-  }));
-  return { allMessages, conversations, savedAt };
-}
-
-async function clearDB() {
-  const db = await openDB();
-  const tx = db.transaction("data", "readwrite");
-  tx.objectStore("data").clear();
-  return new Promise((resolve) => { tx.oncomplete = resolve; });
-}
-
-// --- Parser for Google Voice Takeout HTML files ---
-function parseGVoiceHTML(htmlString, fileName) {
-  const parser = new DOMParser();
-  const doc = parser.parseFromString(htmlString, "text/html");
-  const messages = [];
-
-  // Try multiple known Google Voice Takeout formats
-  // Format 1: Modern Takeout with <div class="message">
-  const messageDivs = doc.querySelectorAll(".message, .hChatLog .message");
-  if (messageDivs.length > 0) {
-    messageDivs.forEach((div) => {
-      const senderEl =
-        div.querySelector(".sender, cite, .fn") ||
-        div.querySelector('[class*="sender"]');
-      const timeEl =
-        div.querySelector(".dt, abbr, time") ||
-        div.querySelector('[class*="time"]');
-      const bodyEl =
-        div.querySelector(".SMS, .sms, q, .message-text") ||
-        div.querySelector('[class*="text"]');
-
-      const sender = senderEl?.textContent?.trim() || "Unknown";
-      const timeStr =
-        timeEl?.getAttribute("title") ||
-        timeEl?.getAttribute("datetime") ||
-        timeEl?.textContent?.trim() ||
-        "";
-      const body = bodyEl?.textContent?.trim() || div.textContent?.trim() || "";
-
-      if (body) {
-        messages.push({
-          sender,
-          time: timeStr,
-          date: timeStr ? new Date(timeStr) : null,
-          body,
-          file: fileName,
-        });
-      }
-    });
+async function fetchAllMessages() {
+  const all = [];
+  const PAGE = 1000;
+  let from = 0;
+  while (true) {
+    const { data, error } = await supabase
+      .from("messages")
+      .select("*")
+      .range(from, from + PAGE - 1)
+      .order("id");
+    if (error) throw error;
+    if (!data || data.length === 0) break;
+    all.push(...data);
+    if (data.length < PAGE) break;
+    from += PAGE;
   }
-
-  // Format 2: Older format with specific class patterns
-  if (messages.length === 0) {
-    const rows = doc.querySelectorAll("div.haudio, div[class*='message']");
-    rows.forEach((row) => {
-      const sender =
-        row.querySelector("span.fn, cite")?.textContent?.trim() || "Unknown";
-      const timeStr =
-        row.querySelector("abbr")?.getAttribute("title") ||
-        row.querySelector("abbr")?.textContent?.trim() ||
-        "";
-      const body =
-        row.querySelector("q, span.sms-text, div.sms-text")?.textContent?.trim() ||
-        "";
-
-      if (body) {
-        messages.push({
-          sender,
-          time: timeStr,
-          date: timeStr ? new Date(timeStr) : null,
-          body,
-          file: fileName,
-        });
-      }
-    });
-  }
-
-  // Format 3: Fallback - look for any structured text content
-  if (messages.length === 0) {
-    const allDivs = doc.querySelectorAll("div");
-    let currentSender = "";
-    let currentTime = "";
-
-    allDivs.forEach((div) => {
-      const abbrEl = div.querySelector("abbr");
-      const citeEl = div.querySelector("cite");
-      const qEl = div.querySelector("q");
-
-      if (citeEl) currentSender = citeEl.textContent.trim();
-      if (abbrEl)
-        currentTime =
-          abbrEl.getAttribute("title") || abbrEl.textContent.trim();
-      if (qEl && qEl.textContent.trim()) {
-        messages.push({
-          sender: currentSender || "Unknown",
-          time: currentTime,
-          date: currentTime ? new Date(currentTime) : null,
-          body: qEl.textContent.trim(),
-          file: fileName,
-        });
-      }
-    });
-  }
-
-  // Extract conversation partner from filename
-  // Google Voice files are typically named like "Contact Name - Text - 2023-01-15T12_00_00Z.html"
-  let contact = fileName.replace(/\.html$/i, "");
-  const dashParts = contact.split(" - ");
-  if (dashParts.length >= 2) {
-    contact = dashParts[0].trim();
-  }
-
-  return { messages, contact, fileName };
+  return all.map((row) => ({
+    sender: row.sender,
+    body: row.body,
+    time: row.time_str || "",
+    date: row.date ? new Date(row.date) : null,
+    file: row.file,
+    contact: row.contact,
+  }));
 }
 
 // --- Formatting helpers ---
@@ -221,120 +73,31 @@ export default function GoogleVoiceSearch() {
   const [searchQuery, setSearchQuery] = useState("");
   const [contactFilter, setContactFilter] = useState("all");
   const [dateSort, setDateSort] = useState("newest");
-  const [isLoading, setIsLoading] = useState(false);
-  const [loadingProgress, setLoadingProgress] = useState({ done: 0, total: 0 });
+  const [isLoading, setIsLoading] = useState(true);
+  const [loadError, setLoadError] = useState(null);
   const [selectedConversation, setSelectedConversation] = useState(null);
   const [view, setView] = useState("search"); // "search" | "conversation"
-  const [dragOver, setDragOver] = useState(false);
-  const [dbLoading, setDbLoading] = useState(true);
-  const fileInputRef = useRef(null);
   const searchInputRef = useRef(null);
   const resultsRef = useRef(null);
 
-  // Load cached data from IndexedDB on mount
+  // Load messages from Supabase on mount
   useEffect(() => {
-    loadFromDB()
-      .then((data) => {
-        if (data) {
-          setAllMessages(data.allMessages);
-          setConversations(data.conversations);
-        }
+    fetchAllMessages()
+      .then((msgs) => {
+        setAllMessages(msgs);
+        // Group into conversations by file
+        const convoMap = new Map();
+        msgs.forEach((m) => {
+          if (!convoMap.has(m.file)) {
+            convoMap.set(m.file, { messages: [], contact: m.contact, fileName: m.file });
+          }
+          convoMap.get(m.file).messages.push(m);
+        });
+        setConversations(Array.from(convoMap.values()));
       })
-      .catch(() => {})
-      .finally(() => setDbLoading(false));
+      .catch((err) => setLoadError(err.message))
+      .finally(() => setIsLoading(false));
   }, []);
-
-  const handleFiles = useCallback(async (files) => {
-    const htmlFiles = Array.from(files).filter((f) =>
-      f.name.toLowerCase().endsWith(".html")
-    );
-    if (htmlFiles.length === 0) return;
-
-    setIsLoading(true);
-    setLoadingProgress({ done: 0, total: htmlFiles.length });
-
-    const convos = [];
-    const msgs = [];
-    const batchSize = 50;
-
-    for (let i = 0; i < htmlFiles.length; i += batchSize) {
-      const batch = htmlFiles.slice(i, i + batchSize);
-      const results = await Promise.all(
-        batch.map(
-          (file) =>
-            new Promise((resolve) => {
-              const reader = new FileReader();
-              reader.onload = (e) => {
-                const parsed = parseGVoiceHTML(e.target.result, file.name);
-                resolve(parsed);
-              };
-              reader.onerror = () => resolve({ messages: [], contact: file.name, fileName: file.name });
-              reader.readAsText(file);
-            })
-        )
-      );
-
-      results.forEach((r) => {
-        if (r.messages.length > 0) {
-          convos.push(r);
-          r.messages.forEach((m) => msgs.push({ ...m, contact: r.contact }));
-        }
-      });
-
-      setLoadingProgress({ done: Math.min(i + batchSize, htmlFiles.length), total: htmlFiles.length });
-      // Let UI breathe
-      await new Promise((r) => setTimeout(r, 0));
-    }
-
-    setConversations(convos);
-    setAllMessages(msgs);
-    setIsLoading(false);
-
-    // Persist parsed data to IndexedDB
-    saveToDB(convos, msgs).catch(() => {});
-  }, []);
-
-  const handleDrop = useCallback(
-    (e) => {
-      e.preventDefault();
-      setDragOver(false);
-      const items = e.dataTransfer.items;
-      if (items) {
-        const entries = [];
-        for (let i = 0; i < items.length; i++) {
-          const entry = items[i].webkitGetAsEntry?.();
-          if (entry) entries.push(entry);
-        }
-        if (entries.length > 0 && entries[0].isDirectory) {
-          // Read directory recursively
-          const dirReader = entries[0].createReader();
-          const allFiles = [];
-          const readEntries = () => {
-            dirReader.readEntries((results) => {
-              if (results.length === 0) {
-                Promise.all(
-                  allFiles.map(
-                    (entry) =>
-                      new Promise((resolve) => entry.file((f) => resolve(f)))
-                  )
-                ).then(handleFiles);
-              } else {
-                results.forEach((r) => {
-                  if (r.isFile && r.name.toLowerCase().endsWith(".html"))
-                    allFiles.push(r);
-                });
-                readEntries();
-              }
-            });
-          };
-          readEntries();
-          return;
-        }
-      }
-      handleFiles(e.dataTransfer.files);
-    },
-    [handleFiles]
-  );
 
   const contacts = useMemo(() => {
     const set = new Set(allMessages.map((m) => m.contact));
@@ -430,149 +193,61 @@ export default function GoogleVoiceSearch() {
     margin: "0",
   };
 
-  // --- DB LOADING STATE ---
-  if (dbLoading) {
+  // --- LOADING STATE ---
+  if (isLoading) {
+    return (
+      <div style={baseStyle}>
+        <style>{fonts}</style>
+        <style>{`
+          * { box-sizing: border-box; margin: 0; padding: 0; }
+          @keyframes pulse { 0%, 100% { opacity: 0.4; } 50% { opacity: 1; } }
+        `}</style>
+        <div style={{
+          display: "flex", flexDirection: "column", alignItems: "center",
+          justifyContent: "center", minHeight: "100vh", padding: "40px",
+        }}>
+          <div style={{ fontSize: "40px", marginBottom: "24px", animation: "pulse 1.5s ease-in-out infinite" }}>📱</div>
+          <p style={{ fontWeight: 600, fontSize: "18px" }}>Loading archive…</p>
+          <p style={{ color: "var(--text-dim)", fontSize: "13px", marginTop: "8px" }}>
+            Fetching messages from database
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  // --- ERROR STATE ---
+  if (loadError) {
     return (
       <div style={baseStyle}>
         <style>{fonts}</style>
         <style>{`* { box-sizing: border-box; margin: 0; padding: 0; }`}</style>
         <div style={{
           display: "flex", flexDirection: "column", alignItems: "center",
-          justifyContent: "center", minHeight: "100vh",
+          justifyContent: "center", minHeight: "100vh", padding: "40px", textAlign: "center",
         }}>
-          <div style={{ fontSize: "40px", marginBottom: "16px" }}>📱</div>
-          <p style={{ color: "var(--text-muted)", fontSize: "15px" }}>Loading archive…</p>
+          <div style={{ fontSize: "40px", marginBottom: "16px" }}>⚠️</div>
+          <p style={{ fontWeight: 600, fontSize: "18px", marginBottom: "8px" }}>Failed to load messages</p>
+          <p style={{ color: "var(--text-dim)", fontSize: "14px", maxWidth: "400px" }}>{loadError}</p>
         </div>
       </div>
     );
   }
 
   // --- EMPTY STATE ---
-  if (allMessages.length === 0 && !isLoading) {
-    return (
-      <div style={baseStyle}>
-        <style>{fonts}</style>
-        <style>{`
-          * { box-sizing: border-box; margin: 0; padding: 0; }
-          ::selection { background: #F9E54740; color: #fff; }
-          @keyframes float { 0%, 100% { transform: translateY(0px); } 50% { transform: translateY(-8px); } }
-          @keyframes pulse { 0%, 100% { opacity: 0.4; } 50% { opacity: 1; } }
-          @keyframes fadeIn { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
-        `}</style>
-        <div style={{
-          display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
-          minHeight: "100vh", padding: "40px 20px", textAlign: "center",
-        }}>
-          <div style={{
-            animation: "float 4s ease-in-out infinite",
-            fontSize: "56px", marginBottom: "32px", lineHeight: 1,
-          }}>
-            📱
-          </div>
-          <h1 style={{
-            fontFamily: "var(--font)", fontWeight: 700, fontSize: "clamp(28px, 5vw, 42px)",
-            letterSpacing: "-0.02em", marginBottom: "12px",
-            background: "linear-gradient(135deg, #F9E547, #E4E4E8)",
-            WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent",
-          }}>
-            Voice Archive
-          </h1>
-          <p style={{
-            color: "var(--text-muted)", fontSize: "16px", maxWidth: "420px",
-            lineHeight: 1.6, marginBottom: "40px",
-          }}>
-            Search through your entire Google Voice text message history.
-            Drop your Takeout HTML files to get started.
-          </p>
-
-          <div
-            onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
-            onDragLeave={() => setDragOver(false)}
-            onDrop={handleDrop}
-            onClick={() => fileInputRef.current?.click()}
-            style={{
-              width: "100%", maxWidth: "520px", padding: "48px 32px",
-              border: `2px dashed ${dragOver ? "var(--accent)" : "var(--border)"}`,
-              borderRadius: "16px", cursor: "pointer",
-              background: dragOver ? "var(--accent-dim)" : "var(--bg-raised)",
-              transition: "all 0.3s ease",
-              animation: "fadeIn 0.6s ease-out",
-            }}
-          >
-            <div style={{
-              width: "56px", height: "56px", borderRadius: "14px",
-              background: "var(--accent-dim)", display: "flex", alignItems: "center",
-              justifyContent: "center", margin: "0 auto 20px", fontSize: "24px",
-            }}>
-              ↑
-            </div>
-            <p style={{ fontWeight: 600, fontSize: "17px", marginBottom: "8px" }}>
-              Drop your Calls folder here
-            </p>
-            <p style={{ color: "var(--text-muted)", fontSize: "14px", lineHeight: 1.5 }}>
-              or click to browse · accepts .html files from<br />
-              <span style={{ fontFamily: "var(--mono)", fontSize: "12px", color: "var(--text-dim)" }}>
-                Takeout/Voice/Calls/
-              </span>
-            </p>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept=".html"
-              multiple
-              style={{ display: "none" }}
-              onChange={(e) => handleFiles(e.target.files)}
-            />
-          </div>
-
-          <div style={{
-            marginTop: "48px", padding: "20px 28px", borderRadius: "12px",
-            background: "var(--bg-raised)", border: "1px solid var(--border)",
-            maxWidth: "520px", width: "100%", textAlign: "left",
-          }}>
-            <p style={{ fontFamily: "var(--mono)", fontSize: "12px", color: "var(--accent)", marginBottom: "8px", letterSpacing: "0.05em" }}>
-              HOW TO EXPORT
-            </p>
-            <ol style={{ color: "var(--text-muted)", fontSize: "14px", lineHeight: 1.8, paddingLeft: "18px" }}>
-              <li>Go to <span style={{ fontFamily: "var(--mono)", color: "var(--text)", fontSize: "12px" }}>takeout.google.com</span></li>
-              <li>Deselect all, then check <strong style={{ color: "var(--text)" }}>Voice</strong></li>
-              <li>Export &amp; download the .zip</li>
-              <li>Unzip and drop the <span style={{ fontFamily: "var(--mono)", color: "var(--text)", fontSize: "12px" }}>Calls/</span> folder here</li>
-            </ol>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  // --- LOADING STATE ---
-  if (isLoading) {
-    const pct = loadingProgress.total > 0
-      ? Math.round((loadingProgress.done / loadingProgress.total) * 100)
-      : 0;
+  if (allMessages.length === 0) {
     return (
       <div style={baseStyle}>
         <style>{fonts}</style>
         <style>{`* { box-sizing: border-box; margin: 0; padding: 0; }`}</style>
         <div style={{
           display: "flex", flexDirection: "column", alignItems: "center",
-          justifyContent: "center", minHeight: "100vh", padding: "40px",
+          justifyContent: "center", minHeight: "100vh", padding: "40px", textAlign: "center",
         }}>
-          <div style={{ fontSize: "40px", marginBottom: "24px", animation: "pulse 1.5s ease-in-out infinite" }}>⏳</div>
-          <p style={{ fontWeight: 600, fontSize: "18px", marginBottom: "16px" }}>
-            Parsing {loadingProgress.total.toLocaleString()} files…
-          </p>
-          <div style={{
-            width: "300px", height: "6px", borderRadius: "3px",
-            background: "var(--bg-raised)", overflow: "hidden",
-          }}>
-            <div style={{
-              width: `${pct}%`, height: "100%", borderRadius: "3px",
-              background: "var(--accent)", transition: "width 0.3s ease",
-            }} />
-          </div>
-          <p style={{ color: "var(--text-dim)", fontSize: "13px", marginTop: "12px", fontFamily: "var(--mono)" }}>
-            {loadingProgress.done} / {loadingProgress.total} · {pct}%
+          <div style={{ fontSize: "40px", marginBottom: "16px" }}>📱</div>
+          <p style={{ fontWeight: 600, fontSize: "18px", marginBottom: "8px" }}>No messages yet</p>
+          <p style={{ color: "var(--text-dim)", fontSize: "14px", maxWidth: "400px" }}>
+            Run the upload script to import your Google Voice Takeout files.
           </p>
         </div>
       </div>
@@ -696,22 +371,6 @@ export default function GoogleVoiceSearch() {
             )}
           </div>
         </div>
-        <button
-          onClick={() => {
-            setConversations([]);
-            setAllMessages([]);
-            setSearchQuery("");
-            setContactFilter("all");
-            clearDB().catch(() => {});
-          }}
-          style={{
-            background: "none", border: "1px solid var(--border)", color: "var(--text-muted)",
-            padding: "6px 14px", borderRadius: "8px", cursor: "pointer",
-            fontFamily: "var(--font)", fontSize: "12px",
-          }}
-        >
-          Load different files
-        </button>
       </div>
 
       {/* Search Bar */}
