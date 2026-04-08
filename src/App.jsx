@@ -9,6 +9,174 @@ const supabase = createClient(
 const THREADS_PAGE_SIZE = 10;
 const SEARCH_PAGE_SIZE = 50;
 
+// --- Shared styles ---
+const cssVars = {
+  "--bg": "#0C0C0E",
+  "--bg-raised": "#16161A",
+  "--bg-hover": "#1E1E24",
+  "--border": "#2A2A32",
+  "--text": "#E4E4E8",
+  "--text-muted": "#8888A0",
+  "--text-dim": "#5C5C72",
+  "--accent": "#F9E547",
+  "--accent-dim": "#F9E54720",
+  "--green": "#4ADE80",
+  "--blue": "#60A5FA",
+  "--red": "#F87171",
+  "--radius": "10px",
+  "--font": "'Outfit', sans-serif",
+  "--mono": "'DM Mono', monospace",
+};
+
+const baseStyle = {
+  ...cssVars,
+  fontFamily: "var(--font)",
+  background: "var(--bg)",
+  color: "var(--text)",
+  minHeight: "100vh",
+  padding: "0",
+  margin: "0",
+};
+
+const globalCSS = `
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  ::selection { background: #F9E54740; color: #fff; }
+  input:focus, select:focus { outline: none; border-color: var(--accent) !important; }
+  @keyframes pulse { 0%, 100% { opacity: 0.4; } 50% { opacity: 1; } }
+  @keyframes fadeUp { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+  @keyframes slideIn { from { opacity: 0; transform: translateX(20px); } to { opacity: 1; transform: translateX(0); } }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
+`;
+
+// --- Login Screen ---
+function LoginScreen() {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState(null);
+  const [loading, setLoading] = useState(false);
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setError(null);
+    setLoading(true);
+    const { error: authError } = await supabase.auth.signInWithPassword({ email, password });
+    if (authError) {
+      setError(authError.message);
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div style={baseStyle}>
+      <style>{globalCSS}</style>
+      <div style={{
+        display: "flex", flexDirection: "column", alignItems: "center",
+        justifyContent: "center", minHeight: "100vh", padding: "40px 20px",
+      }}>
+        <div style={{ animation: "fadeIn 0.6s ease-out" }}>
+          <div style={{ textAlign: "center", marginBottom: "32px" }}>
+            <div style={{ fontSize: "48px", marginBottom: "16px" }}>📱</div>
+            <h1 style={{
+              fontWeight: 700, fontSize: "28px", letterSpacing: "-0.02em",
+              background: "linear-gradient(135deg, #F9E547, #E4E4E8)",
+              WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent",
+            }}>
+              Voice Archive
+            </h1>
+            <p style={{ color: "var(--text-muted)", fontSize: "14px", marginTop: "8px" }}>
+              Sign in to access your archive
+            </p>
+          </div>
+
+          <form onSubmit={handleSubmit} style={{
+            width: "320px", display: "flex", flexDirection: "column", gap: "12px",
+          }}>
+            <input
+              type="email"
+              placeholder="Email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              required
+              style={{
+                padding: "12px 14px", background: "var(--bg-raised)",
+                border: "1px solid var(--border)", borderRadius: "10px",
+                color: "var(--text)", fontSize: "15px", fontFamily: "var(--font)",
+              }}
+            />
+            <input
+              type="password"
+              placeholder="Password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              required
+              style={{
+                padding: "12px 14px", background: "var(--bg-raised)",
+                border: "1px solid var(--border)", borderRadius: "10px",
+                color: "var(--text)", fontSize: "15px", fontFamily: "var(--font)",
+              }}
+            />
+            <button
+              type="submit"
+              disabled={loading}
+              style={{
+                padding: "12px", background: "var(--accent)", border: "none",
+                borderRadius: "10px", color: "#0C0C0E", fontSize: "15px",
+                fontWeight: 600, fontFamily: "var(--font)", cursor: loading ? "default" : "pointer",
+                opacity: loading ? 0.6 : 1, transition: "opacity 0.15s ease",
+              }}
+            >
+              {loading ? "Signing in…" : "Sign in"}
+            </button>
+            {error && (
+              <p style={{
+                color: "var(--red)", fontSize: "13px", textAlign: "center",
+                padding: "8px", background: "#F8717120", borderRadius: "8px",
+              }}>
+                {error}
+              </p>
+            )}
+          </form>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// --- Auth wrapper (exported as default) ---
+export default function App() {
+  const [session, setSession] = useState(undefined); // undefined = loading, null = not authed
+
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setSession(session);
+    });
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setSession(session);
+    });
+
+    return () => subscription.unsubscribe();
+  }, []);
+
+  // Still checking session
+  if (session === undefined) {
+    return (
+      <div style={baseStyle}>
+        <style>{globalCSS}</style>
+        <div style={{
+          display: "flex", alignItems: "center", justifyContent: "center", minHeight: "100vh",
+        }}>
+          <div style={{ fontSize: "40px", animation: "pulse 1.5s ease-in-out infinite" }}>📱</div>
+        </div>
+      </div>
+    );
+  }
+
+  if (!session) return <LoginScreen />;
+
+  return <GoogleVoiceSearch />;
+}
+
 // --- Formatting helpers ---
 function formatDate(date) {
   if (!date || isNaN(date)) return "";
@@ -72,7 +240,7 @@ function SkeletonBubble({ align }) {
 }
 
 // --- Main App ---
-export default function GoogleVoiceSearch() {
+function GoogleVoiceSearch() {
   // Thread list state
   const [threads, setThreads] = useState([]);
   const [threadsLoading, setThreadsLoading] = useState(true);
@@ -254,45 +422,7 @@ export default function GoogleVoiceSearch() {
     }
   }, [threadsLoading]);
 
-  // --- STYLES ---
-  const fonts = ``;
-
-  const cssVars = {
-    "--bg": "#0C0C0E",
-    "--bg-raised": "#16161A",
-    "--bg-hover": "#1E1E24",
-    "--border": "#2A2A32",
-    "--text": "#E4E4E8",
-    "--text-muted": "#8888A0",
-    "--text-dim": "#5C5C72",
-    "--accent": "#F9E547",
-    "--accent-dim": "#F9E54720",
-    "--green": "#4ADE80",
-    "--blue": "#60A5FA",
-    "--red": "#F87171",
-    "--radius": "10px",
-    "--font": "'Outfit', sans-serif",
-    "--mono": "'DM Mono', monospace",
-  };
-
-  const baseStyle = {
-    ...cssVars,
-    fontFamily: "var(--font)",
-    background: "var(--bg)",
-    color: "var(--text)",
-    minHeight: "100vh",
-    padding: "0",
-    margin: "0",
-  };
-
-  const globalCSS = `
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    ::selection { background: #F9E54740; color: #fff; }
-    input:focus, select:focus { outline: none; border-color: var(--accent) !important; }
-    @keyframes pulse { 0%, 100% { opacity: 0.4; } 50% { opacity: 1; } }
-    @keyframes fadeUp { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
-    @keyframes slideIn { from { opacity: 0; transform: translateX(20px); } to { opacity: 1; transform: translateX(0); } }
-  `;
+  const handleLogout = () => supabase.auth.signOut();
 
   // --- ERROR STATE ---
   if (loadError) {
@@ -429,6 +559,16 @@ export default function GoogleVoiceSearch() {
             )}
           </div>
         </div>
+        <button
+          onClick={handleLogout}
+          style={{
+            background: "none", border: "1px solid var(--border)", color: "var(--text-dim)",
+            padding: "6px 12px", borderRadius: "8px", cursor: "pointer",
+            fontFamily: "var(--font)", fontSize: "12px",
+          }}
+        >
+          Sign out
+        </button>
       </div>
 
       {/* Search Bar */}
