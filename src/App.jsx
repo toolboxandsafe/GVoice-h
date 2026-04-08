@@ -1,5 +1,80 @@
 import { useState, useCallback, useMemo, useRef, useEffect } from "react";
 
+// --- IndexedDB persistence ---
+const DB_NAME = "gvoice-archive";
+const DB_VERSION = 1;
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains("data")) {
+        db.createObjectStore("data");
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function saveToDB(conversations, allMessages) {
+  const db = await openDB();
+  const tx = db.transaction("data", "readwrite");
+  const store = tx.objectStore("data");
+  // Serialize dates to timestamps for storage
+  const serializedMessages = allMessages.map((m) => ({
+    ...m,
+    date: m.date ? m.date.getTime() : null,
+  }));
+  const serializedConvos = conversations.map((c) => ({
+    ...c,
+    messages: c.messages.map((m) => ({
+      ...m,
+      date: m.date ? m.date.getTime() : null,
+    })),
+  }));
+  store.put(serializedMessages, "allMessages");
+  store.put(serializedConvos, "conversations");
+  store.put(Date.now(), "savedAt");
+  return new Promise((resolve, reject) => {
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function loadFromDB() {
+  const db = await openDB();
+  const tx = db.transaction("data", "readonly");
+  const store = tx.objectStore("data");
+  const [msgs, convos, savedAt] = await Promise.all([
+    new Promise((r) => { const req = store.get("allMessages"); req.onsuccess = () => r(req.result); req.onerror = () => r(null); }),
+    new Promise((r) => { const req = store.get("conversations"); req.onsuccess = () => r(req.result); req.onerror = () => r(null); }),
+    new Promise((r) => { const req = store.get("savedAt"); req.onsuccess = () => r(req.result); req.onerror = () => r(null); }),
+  ]);
+  if (!msgs || !convos) return null;
+  // Restore dates from timestamps
+  const allMessages = msgs.map((m) => ({
+    ...m,
+    date: m.date ? new Date(m.date) : null,
+  }));
+  const conversations = convos.map((c) => ({
+    ...c,
+    messages: c.messages.map((m) => ({
+      ...m,
+      date: m.date ? new Date(m.date) : null,
+    })),
+  }));
+  return { allMessages, conversations, savedAt };
+}
+
+async function clearDB() {
+  const db = await openDB();
+  const tx = db.transaction("data", "readwrite");
+  tx.objectStore("data").clear();
+  return new Promise((resolve) => { tx.oncomplete = resolve; });
+}
+
 // --- Parser for Google Voice Takeout HTML files ---
 function parseGVoiceHTML(htmlString, fileName) {
   const parser = new DOMParser();
@@ -151,9 +226,23 @@ export default function GoogleVoiceSearch() {
   const [selectedConversation, setSelectedConversation] = useState(null);
   const [view, setView] = useState("search"); // "search" | "conversation"
   const [dragOver, setDragOver] = useState(false);
+  const [dbLoading, setDbLoading] = useState(true);
   const fileInputRef = useRef(null);
   const searchInputRef = useRef(null);
   const resultsRef = useRef(null);
+
+  // Load cached data from IndexedDB on mount
+  useEffect(() => {
+    loadFromDB()
+      .then((data) => {
+        if (data) {
+          setAllMessages(data.allMessages);
+          setConversations(data.conversations);
+        }
+      })
+      .catch(() => {})
+      .finally(() => setDbLoading(false));
+  }, []);
 
   const handleFiles = useCallback(async (files) => {
     const htmlFiles = Array.from(files).filter((f) =>
@@ -200,6 +289,9 @@ export default function GoogleVoiceSearch() {
     setConversations(convos);
     setAllMessages(msgs);
     setIsLoading(false);
+
+    // Persist parsed data to IndexedDB
+    saveToDB(convos, msgs).catch(() => {});
   }, []);
 
   const handleDrop = useCallback(
@@ -337,6 +429,23 @@ export default function GoogleVoiceSearch() {
     padding: "0",
     margin: "0",
   };
+
+  // --- DB LOADING STATE ---
+  if (dbLoading) {
+    return (
+      <div style={baseStyle}>
+        <style>{fonts}</style>
+        <style>{`* { box-sizing: border-box; margin: 0; padding: 0; }`}</style>
+        <div style={{
+          display: "flex", flexDirection: "column", alignItems: "center",
+          justifyContent: "center", minHeight: "100vh",
+        }}>
+          <div style={{ fontSize: "40px", marginBottom: "16px" }}>📱</div>
+          <p style={{ color: "var(--text-muted)", fontSize: "15px" }}>Loading archive…</p>
+        </div>
+      </div>
+    );
+  }
 
   // --- EMPTY STATE ---
   if (allMessages.length === 0 && !isLoading) {
@@ -593,6 +702,7 @@ export default function GoogleVoiceSearch() {
             setAllMessages([]);
             setSearchQuery("");
             setContactFilter("all");
+            clearDB().catch(() => {});
           }}
           style={{
             background: "none", border: "1px solid var(--border)", color: "var(--text-muted)",
